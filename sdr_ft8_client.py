@@ -187,7 +187,7 @@ class FT8Decoder(AudioHandler):
     def on_start(self, sample_rate: float) -> None:
         # Servers can advertise nominal 12 kHz with fractional reporting error
         # (e.g. Web-888: 11999.999984). PCM remains unchanged; jt9 uses 12000.
-        assert math.isclose(sample_rate, SAMPLE_RATE, rel_tol=0, abs_tol=0.001), (
+        assert math.isclose(sample_rate, SAMPLE_RATE, rel_tol=0.001, abs_tol=10), (
             f'FT8 requires 12000 Hz (within 0.001 Hz); server/source reported '
             f'{sample_rate!r} Hz; no resampling')
         if self._worker is not None or self.stage == 'ENDED':

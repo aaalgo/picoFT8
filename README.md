@@ -70,9 +70,9 @@ worker records completed transmissions, retrying transient HTTP failures with
 the same handle and slot within the server's ten-minute retention window.
 Network calls and conversion never run on the serial thread.
 
-Server mode uses a fixed TX parity: `--tx-parity auto` (the default) selects the
-first slot with sufficient preparation time; `--tx-parity even` or `odd` fixes it
-explicitly. Requests have at least `--allowance 10` seconds of lead time. The next
+Server mode attempts transmission every 15-second slot, starting with the
+first slot with sufficient preparation time. Requests have at least
+`--allowance 10` seconds of lead time. The next
 request starts at the previously requested slot boundary, allowing it to overlap
 transmission. Offers that arrive or finish encoding after their target boundary
 are discarded. Failed requests do not cause a fallback CQ or reuse of an old offer.

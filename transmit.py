@@ -48,8 +48,6 @@ def parse_args(argv=None):
                         help="minimum server request lead time in seconds (default: 10)")
     parser.add_argument("--timeout", type=float, default=10.0,
                         help="HTTP socket and message-conversion timeout in seconds")
-    parser.add_argument("--tx-parity", choices=("auto", "even", "odd"), default="auto",
-                        help="server mode: fixed parity; auto chooses the first eligible slot")
     args = parser.parse_args(argv)
     if not 0 <= args.freq <= (1 << 64) - 1 - 7 * TONE_SPACING:
         parser.error("--freq must fit in an unsigned 64-bit integer with room for all tones")
@@ -148,11 +146,9 @@ def wait_until(deadline):
             time.sleep(remaining - 0.002)
 
 
-def next_target(now_ns, allowance_ns, tx_parity=None):
+def next_target(now_ns, allowance_ns):
     target = (now_ns // SLOT_NS + 1) * SLOT_NS
     while target - now_ns < allowance_ns:
-        target += SLOT_NS
-    if tx_parity is not None and (target // SLOT_NS) % 2 != tx_parity:
         target += SLOT_NS
     return target
 
@@ -251,9 +247,6 @@ class ServerTransmitter:
         self.frames = queue.Queue(maxsize=2)
         self.acks = queue.Queue(maxsize=32)
         self.allowance_ns = round(args.allowance * NS)
-        first = next_target(time.time_ns(), self.allowance_ns)
-        self.parity = ((first // SLOT_NS) % 2 if args.tx_parity == "auto"
-                       else int(args.tx_parity == "odd"))
 
     def prepare(self, slot_ns):
         result = self.api.request(f"/api/tx/todo/?utc_ns={slot_ns}")
@@ -271,7 +264,7 @@ class ServerTransmitter:
     def request_loop(self):
         last_target = -1
         while not self.stop.is_set():
-            target = next_target(time.time_ns(), self.allowance_ns, self.parity)
+            target = next_target(time.time_ns(), self.allowance_ns)
             if target <= last_target:
                 if not wait_for_utc(last_target, self.stop):
                     return
@@ -339,7 +332,7 @@ class ServerTransmitter:
     def run(self, ser):
         workers = [threading.Thread(target=self.request_loop, name="ft8-request", daemon=True),
                    threading.Thread(target=self.acknowledgment_loop, name="ft8-ack", daemon=True)]
-        print(f"Master TX parity={'odd' if self.parity else 'even'}; "
+        print(f"Master TX every 15-second slot; "
               f"allowance={self.args.allowance:g}s", file=sys.stderr)
         for worker in workers:
             worker.start()
