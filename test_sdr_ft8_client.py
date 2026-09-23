@@ -1,4 +1,5 @@
 """Pipeline tests use deterministic decoder doubles; no radio is required."""
+import argparse
 import contextlib
 import io
 import json
@@ -12,8 +13,72 @@ import numpy as np
 
 import jt9
 from sdr_ft8_client import (AudioChunk, DecoderConfig, FT8Decoder, SAMPLE_RATE,
-                            detection_for, main, parse_utc)
+                            MasterPoster, detection_for, main, parse_address, parse_utc,
+                            print_detection)
 from sdr_sources import EndReason, WavFileSource
+
+
+class MasterTests(unittest.TestCase):
+    def test_addresses_and_cli(self):
+        for address in ('localhost:8074', '127.0.0.1:7777', '[::1]:7777'):
+            self.assertEqual(parse_address(address), address)
+        for address in ('localhost', 'host:0', 'host:65536', 'host:abc',
+                        'http://host:7777', 'host:7777/path'):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                parse_address(address)
+        with patch('sdr_ft8_client.KiwiServerSource') as source:
+            source.return_value.run.side_effect = lambda handler: None
+            self.assertEqual(main(['-s', 'localhost:8074']), 0)
+            self.assertEqual(source.call_args.args, ('localhost', 8074))
+            handler = source.return_value.run.call_args.args[0]
+            self.assertEqual(handler.on_batch.url, 'http://127.0.0.1:7777/api/rx/')
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            main(['-s', 'localhost:8074', '-p', '8074'])
+
+    def test_posts_whole_batches_matching_printed_records(self):
+        record = jt9.DecodeRecord('000000', -10, 0.0, 1000, '~', 'CQ TEST')
+        poster = MasterPoster('localhost:7777', site_id=42)
+        output = io.StringIO()
+        with patch('sdr_ft8_client.urlopen') as post, contextlib.redirect_stdout(output):
+            post.return_value.__enter__.return_value.status = 201
+            handler = FT8Decoder(start_utc_ns=0,
+                                 calibrate=lambda a, r: jt9.CalibrationResult(0, 0, []),
+                                 decode=lambda a, r: [record, record],
+                                 emit=lambda d: print_detection(d, 42), on_batch=poster)
+            handler.on_start(SAMPLE_RATE)
+            handler.on_data(np.zeros(30 * SAMPLE_RATE, dtype=np.int16))
+            handler.on_end(EndReason.EOF)
+        self.assertIsNone(handler.error)
+        printed = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(post.call_count, 2)
+        for index, call in enumerate(post.call_args_list):
+            request = call.args[0]
+            self.assertEqual(request.full_url, 'http://localhost:7777/api/rx/')
+            self.assertEqual(request.get_method(), 'POST')
+            self.assertEqual(json.loads(request.data), printed[index * 2:index * 2 + 2])
+
+    def test_failure_disables_posts_and_warns_once(self):
+        chunk = AudioChunk(0, 0, 0, np.empty(0, dtype=np.int16))
+        record = jt9.DecodeRecord('000000', -10, 0.0, 1000, '~', 'CQ TEST')
+        batch = [detection_for(chunk, record, 'explicit')]
+        for status in (None, 500):
+            with self.subTest(status=status), patch('sdr_ft8_client.urlopen') as post:
+                if status is None:
+                    post.side_effect = OSError('connection refused')
+                else:
+                    post.return_value.__enter__.return_value.status = status
+                poster = MasterPoster('localhost:7777')
+                output = io.StringIO()
+                with contextlib.redirect_stderr(output):
+                    poster([])
+                    poster(batch)
+                    poster(batch)
+                self.assertTrue(poster.failed)
+                self.assertEqual(post.call_count, 1)
+                self.assertEqual(output.getvalue().count('Failed to post to master; not trying in future'), 1)
+        with patch('sdr_ft8_client.urlopen') as post:
+            MasterPoster(None)(batch)
+            post.assert_not_called()
 
 
 class PipelineTests(unittest.TestCase):
