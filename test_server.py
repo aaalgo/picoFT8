@@ -76,6 +76,41 @@ class NanosecondAPITests(unittest.TestCase):
         self.assertEqual(CALLSIGN2QSO['W1ABC'].status, QSOStatus.COMPLETED)
         self.assertIsNone(self.offer(self.slot + 5 * SLOT_NS)['handle'])
 
+    def test_received_rr73_sends_final_73_then_completes(self):
+        self.receive(self.slot, 'RR73')
+        qso = CALLSIGN2QSO['W1ABC']
+        self.assertEqual(qso.phase, QSOPhase.COMPLETE)
+        self.assertEqual(qso.status, QSOStatus.ACTIVE)
+        target = self.slot + SLOT_NS
+        self.assertIsNone(self.offer(self.slot)['handle'])
+        offer = self.offer(target)
+        self.assertEqual(offer['message'], 'W1ABC AC8SS 73')
+        # Requesting an offer does not prove that transmission occurred.
+        self.assertEqual(qso.status, QSOStatus.ACTIVE)
+        self.assertEqual(self.acknowledge(target, offer['handle']).status_code, 200)
+        self.assertEqual(self.acknowledge(target, offer['handle']).status_code, 200)
+        self.assertEqual(qso.current_stage.tx_count, 1)
+        self.assertEqual(qso.status, QSOStatus.COMPLETED)
+        self.assertIsNone(self.offer(target + 2 * SLOT_NS)['handle'])
+        self.receive(self.slot + 4 * SLOT_NS, 'RR73')
+        self.assertEqual(qso.status, QSOStatus.COMPLETED)
+        self.assertIsNone(self.offer(self.slot + 5 * SLOT_NS)['handle'])
+
+    def test_final_73_receipt_after_repeated_rr73_completes(self):
+        self.receive(self.slot, 'RR73')
+        target = self.slot + SLOT_NS
+        offer = self.offer(target)
+        self.receive(self.slot + 2 * SLOT_NS, 'RR73')
+        self.assertEqual(self.acknowledge(target, offer['handle']).status_code, 200)
+        self.assertEqual(CALLSIGN2QSO['W1ABC'].status, QSOStatus.COMPLETED)
+        self.assertIsNone(self.offer(self.slot + 3 * SLOT_NS)['handle'])
+
+    def test_received_73_cancels_pending_final_73(self):
+        self.receive(self.slot, 'RR73')
+        self.receive(self.slot + 2 * SLOT_NS, '73')
+        self.assertEqual(CALLSIGN2QSO['W1ABC'].status, QSOStatus.COMPLETED)
+        self.assertIsNone(self.offer(self.slot + 3 * SLOT_NS)['handle'])
+
     def test_slot_specific_offers_and_duplicate_acknowledgments(self):
         self.receive(self.slot)
         target = self.slot + SLOT_NS
@@ -221,6 +256,73 @@ class NanosecondAPITests(unittest.TestCase):
                     UPDATE ft8_message SET utc_ns = utc_ns * 1000000000;
                     COMMIT;''')
                 self.assertEqual(db.execute('SELECT utc_ns FROM ft8_message').fetchone()[0], self.slot)
+
+
+class ReplayTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / 'replay.sqlite3'
+        self.url = f'sqlite:///{self.path}'
+        self.now = 1_800_000_000 * NS_PER_SECOND
+        self.client = create_app(self.url, now_ns=lambda: self.now).test_client()
+
+    def tearDown(self):
+        CALLSIGN2QSO.clear()
+        self.directory.cleanup()
+
+    def receive(self, call, seconds_ago, payload):
+        response = self.client.post('/api/rx/', json=[{
+            'site_id': 1,
+            'calibrated_utc_ns': self.now - seconds_ago * NS_PER_SECOND,
+            'decode': {'message': f'AC8SS {call} {payload}', 'snr_db': -8},
+        }])
+        self.assertEqual(response.status_code, 201)
+
+    def test_default_window_and_chronological_reconstruction(self):
+        self.receive('OLD', 1801, 'EN82')
+        self.receive('BOUNDARY', 1800, 'EN82')
+        self.receive('FUTURE', -1, 'EN82')
+        # Insert out of order; replay must use message timestamps.
+        self.receive('W1ABC', 30, 'R-12')
+        self.receive('W1ABC', 60, 'EN82')
+        self.receive('DONE', 45, '73')
+        self.receive('DONE', 90, 'R-10')
+        self.receive('FINAL', 15, 'RR73')
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE ft8_message SET type='GRID' WHERE sender='FINAL'")
+        client = create_app(self.url, now_ns=lambda: self.now).test_client()
+        self.assertEqual(set(CALLSIGN2QSO), {'BOUNDARY', 'W1ABC', 'DONE', 'FINAL'})
+        qso = CALLSIGN2QSO['W1ABC']
+        self.assertEqual(qso.phase, QSOPhase.CONFIRMED)
+        self.assertEqual(qso.request_tx(), ('W1ABC AC8SS RR73', self.now - SLOT_NS))
+        self.assertEqual(qso.current_stage.rx_count, 1)
+        self.assertEqual(qso.stages[QSOPhase.REPLIED].rx_count, 1)
+        self.assertEqual(CALLSIGN2QSO['DONE'].status, QSOStatus.COMPLETED)
+        self.assertEqual(CALLSIGN2QSO['FINAL'].request_tx(), ('FINAL AC8SS 73', self.now))
+        # FINAL has opposite parity to the older waiting exchanges.
+        offer = client.get('/api/tx/todo/', query_string={'utc_ns': self.now}).get_json()
+        self.assertEqual(offer['message'], 'FINAL AC8SS 73')
+        self.assertIsNotNone(offer['handle'])
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute(
+                "SELECT type FROM ft8_message WHERE sender='FINAL'"
+            ).fetchone()[0], 'GRID')
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM ft8_message').fetchone()[0], 8)
+
+    def test_custom_window_disabled_replay_and_repeated_startup(self):
+        self.receive('W1ABC', 60, 'EN82')
+        self.receive('W2ABC', 15, 'R-10')
+        for _ in range(2):
+            create_app(self.url, now_ns=lambda: self.now, replay=30)
+            self.assertEqual(set(CALLSIGN2QSO), {'W2ABC'})
+            self.assertEqual(CALLSIGN2QSO['W2ABC'].current_stage.rx_count, 1)
+        create_app(self.url, now_ns=lambda: self.now, replay=0)
+        self.assertEqual(CALLSIGN2QSO, {})
+
+    def test_invalid_replay(self):
+        for value in (-1, 1.5, True):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'replay'):
+                create_app(self.url, replay=value)
 
 
 if __name__ == '__main__':

@@ -28,6 +28,10 @@ def classify_message(text: str) -> MessageType:
 
     payload = parts[2]
 
+    # RR73 also matches the grid pattern; recognize it first.
+    if payload == "RR73":
+        return MessageType.RR73
+
     if re.fullmatch(GRID_RE, payload):
         return MessageType.GRID
 
@@ -39,9 +43,6 @@ def classify_message(text: str) -> MessageType:
 
     if payload == "RRR":
         return MessageType.RRR
-
-    if payload == "RR73":
-        return MessageType.RR73
 
     if payload == "73":
         return MessageType.MSG_73

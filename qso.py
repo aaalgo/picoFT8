@@ -77,6 +77,7 @@ class RuntimeQSO:
 
     # Phases only advance: CQ -> REPLIED -> CONFIRMED -> COMPLETE;
     # skipped phases are allowed. Older messages never downgrade the phase.
+    # COMPLETE can remain ACTIVE while the final 73 awaits transmission.
     # Status transitions: ACTIVE <-> EXPIRED, ACTIVE -> COMPLETED.
     # RX revives EXPIRED before advancing phases. COMPLETED is terminal:
     # further RX updates statistics/parity only, without scheduling more TX.
@@ -103,7 +104,7 @@ class RuntimeQSO:
 
         stage.response_text = response_text
 
-        if phase == QSOPhase.COMPLETE:
+        if phase == QSOPhase.COMPLETE and response_text is None:
             self.status = QSOStatus.COMPLETED
             self.next_tx_utc_ns = None
 
@@ -158,8 +159,16 @@ class RuntimeQSO:
             self._activate_stage(
                 incoming_phase,
                 utc_ns=msg.utc_ns,
-                response_text=response() if response is not None else None,
+                response_text=(
+                    f"{self.callsign} {self.local_call} 73"
+                    if msg.type == MessageType.RR73
+                    else response() if response is not None else None
+                ),
             )
+
+        if msg.type == MessageType.MSG_73:
+            self.status = QSOStatus.COMPLETED
+            self.next_tx_utc_ns = None
 
         stage = self.current_stage
         if incoming_phase == self.phase:
@@ -205,6 +214,12 @@ class RuntimeQSO:
         # Acknowledgments may arrive out of transmission order.
         if stage.last_tx_utc_ns is None or sent_utc_ns > stage.last_tx_utc_ns:
             stage.last_tx_utc_ns = sent_utc_ns
+        # A final 73 needs no reply or retries once transmission is confirmed.
+        # Even a receipt delayed across another RX proves it was sent.
+        if offer.phase == QSOPhase.COMPLETE and self.status != QSOStatus.COMPLETED:
+            self.status = QSOStatus.COMPLETED
+            self.next_tx_utc_ns = None
+            self.scheduling_revision += 1
         if (
             offer.revision != self.scheduling_revision
             or self.status != QSOStatus.ACTIVE

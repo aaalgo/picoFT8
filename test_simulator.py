@@ -117,6 +117,7 @@ class SimulatorTests(unittest.IsolatedAsyncioTestCase):
         from pathlib import Path
         CALLSIGN2QSO.clear()
         with tempfile.TemporaryDirectory() as directory:
+            self.now = 0
             app = create_app(f'sqlite:///{Path(directory) / "test.sqlite3"}', now_ns=lambda: self.now)
 
             class FlaskAPI:

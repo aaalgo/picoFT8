@@ -59,7 +59,11 @@ def monitor(master, show_all=False):
             for record in sorted(records, key=lambda item: item["message_id"]):
                 if record["message_id"] < cursor:
                     continue
-                if show_all or AC8SS.search(clean_text(record["decode"]["message"])):
+                message = clean_text(record["decode"]["message"])
+                if show_all or (
+                    AC8SS.search(message)
+                    and message.strip().upper() != "CQ AC8SS EN82"
+                ):
                     rows.append(format_row(record, color))
                 cursor = record["message_id"] + 1
             if rows:
@@ -76,7 +80,7 @@ def main():
     parser.add_argument("--master", default="127.0.0.1:7777",
                         help="master host:port or URL (default: %(default)s)")
     parser.add_argument("--all", action="store_true",
-                        help="show all messages (default: only messages mentioning AC8SS)")
+                        help="show all messages (default: messages mentioning AC8SS except CQ AC8SS EN82)")
     args = parser.parse_args()
     try:
         monitor(args.master, show_all=args.all)

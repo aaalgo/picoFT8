@@ -82,7 +82,40 @@ def process_message(message: FT8Message) -> None:
     qso.update_rx(message)
 
 
-def create_app(database_url: str | None = None, *, now_ns=time.time_ns) -> Flask:
+def replay_messages(engine, *, seconds: int, now_utc_ns: int) -> None:
+    """Rebuild runtime state from recent inbound messages without rewriting history.
+
+    TX receipts/offers are not persisted, so retry counters restart from the
+    latest RX and outstanding handles cannot survive a restart.
+    """
+    with RUNTIME_LOCK:
+        CALLSIGN2QSO.clear()
+        if seconds == 0:
+            return
+        statement = (
+            select(FT8Message)
+            .where(
+                FT8Message.utc_ns >= now_utc_ns - seconds * NS_PER_SECOND,
+                FT8Message.utc_ns <= now_utc_ns,
+                FT8Message.direction == Direction.RX,
+                FT8Message.receiver == MY_CALLSIGN,
+            )
+            .order_by(FT8Message.utc_ns, FT8Message.message_id)
+        )
+        with Session(engine) as session:
+            for message in session.scalars(statement):
+                # Old databases may classify RR73 as GRID. Reparse only the
+                # detached object so replay cannot change historical records.
+                session.expunge(message)
+                message.type = ft8.classify_message(message.text)
+                process_message(message)
+
+
+def create_app(
+    database_url: str | None = None, *, now_ns=time.time_ns, replay: int = 1800,
+) -> Flask:
+    if type(replay) is not int or replay < 0:
+        raise ValueError("replay must be a nonnegative number of seconds")
     app = Flask(__name__)
     engine = create_engine(
         database_url or os.environ.get("DATABASE_URL", "sqlite:///db.sqlite3")
@@ -96,6 +129,7 @@ def create_app(database_url: str | None = None, *, now_ns=time.time_ns) -> Flask
                 "as described in API.md before starting the server."
             )
     Base.metadata.create_all(engine)
+    replay_messages(engine, seconds=replay, now_utc_ns=now_ns())
     pending_tx: dict[str, PendingTransmission] = {}
     offer_keys: dict[tuple[int, int, int], str] = {}
 
@@ -251,5 +285,11 @@ def create_app(database_url: str | None = None, *, now_ns=time.time_ns) -> Flask
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=7777)
+    parser.add_argument(
+        "--replay", type=int, default=1800, metavar="SECONDS",
+        help="replay recent database messages at startup (default: 1800; 0 disables)",
+    )
     args = parser.parse_args()
-    create_app().run(host="0.0.0.0", port=args.port)
+    if args.replay < 0:
+        parser.error("--replay must be nonnegative")
+    create_app(replay=args.replay).run(host="0.0.0.0", port=args.port)
