@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import enum
 
-from sqlalchemy import Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Enum, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+NS_PER_SECOND = 1_000_000_000
+SLOT_NS = 15 * NS_PER_SECOND
 
 
 class Base(DeclarativeBase):
@@ -33,10 +37,11 @@ class MessageType(str, enum.Enum):
 
     UNKNOWN = "UNKNOWN"
 
-class QSOPhase(str, enum.Enum):
-    REPLIED = "REPLIED"
-    CONFIRMED = "CONFIRMED"
-    COMPLETED = "COMPLETED"
+class QSOPhase(enum.IntEnum):
+    CQ = 0
+    REPLIED = 1
+    CONFIRMED = 2
+    COMPLETE = 3
 
 
 class Site(Base):
@@ -63,12 +68,8 @@ class QSO(Base):
         autoincrement=True,
     )
 
-    phase: Mapped[QSOPhase] = mapped_column(
-        Enum(
-            QSOPhase,
-            native_enum=False,
-            values_callable=lambda enum_cls: [e.value for e in enum_cls],
-        ),
+    phase: Mapped[int] = mapped_column(
+        Integer,
         nullable=False,
         default=QSOPhase.REPLIED,
         index=True,
@@ -114,15 +115,10 @@ class FT8Message(Base):
         index=True,
     )
 
-    # Unix UTC seconds.
-    #
-    # For RX messages this is derived from calibrated_utc_ns:
-    #
-    #     utc = calibrated_utc_ns // 1_000_000_000
-    #
-    # It represents the FT8 slot timestamp, not decoder callback time.
-    utc: Mapped[int] = mapped_column(
-        Integer,
+    # Unix UTC nanoseconds identifying the message's transmission slot,
+    # not the decoder callback time. Preserve subsecond precision on ingestion.
+    utc_ns: Mapped[int] = mapped_column(
+        BigInteger,
         nullable=False,
         index=False,
     )
@@ -195,11 +191,16 @@ class FT8Message(Base):
         nullable=True,
     )
 
+    @property
+    def is_odd(self) -> bool:
+        """Whether this message belongs to an odd 15-second slot."""
+        return bool((self.utc_ns // SLOT_NS) % 2)
+
     def __repr__(self) -> str:
         return (
             f"FT8Message("
             f"id={self.message_id}, "
-            f"utc={self.utc}, "
+            f"utc_ns={self.utc_ns}, "
             f"direction={self.direction.value!r}, "
             f"type={self.type.value!r}, "
             f"sender={self.sender!r}, "
